@@ -1,0 +1,24 @@
+# Global settings
+[settings]
+alive_seconds = 600
+
+# Service definitions
+[[services]]
+name        = "Service 1"
+host        = "service1.local"
+port        = 5522
+exposedPort = 5000
+
+[[services]]
+name        = "Service 2"
+host        = "service2.local"
+port        = 3000
+exposedPort = 3001
+dependencies = ["Service 1"]
+
+[[services]]
+name        = "Service 3"
+host        = "service3.internal"
+port        = 8080
+exposedPort = 8081
+dependencies = ["Service 1", "Service 2"]

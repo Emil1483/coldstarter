@@ -7,6 +7,7 @@
             "request": "launch",
             "mode": "auto",
             "program": "${workspaceFolder}",
+            "console": "integratedTerminal",
             "env": {
                 "CONFIG": "${workspaceFolder}/configs/config.toml"
             }

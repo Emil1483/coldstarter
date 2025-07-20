@@ -13,7 +13,6 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// top-level config
 type Config struct {
 	Settings Settings  `toml:"settings"`
 	Services []Service `toml:"services"`
@@ -31,34 +30,27 @@ type Service struct {
 	Dependencies []string `toml:"dependencies"`
 }
 
+// stopTimers holds one timer per service name
+var (
+	stopTimers   = make(map[string]*time.Timer)
+	stopTimersMu sync.Mutex
+)
+
 func main() {
-	// load CONFIG env var
 	cfgPath := os.Getenv("CONFIG")
 	if cfgPath == "" {
-		log.Fatal("CONFIG environment variable not set")
+		log.Fatal("CONFIG env var not set")
 	}
 
-	// parse TOML
 	var cfg Config
 	if _, err := toml.DecodeFile(cfgPath, &cfg); err != nil {
 		log.Fatalf("failed to decode TOML: %v", err)
 	}
 
-	// build lookup map
 	svcMap := make(map[string]Service, len(cfg.Services))
 	for _, s := range cfg.Services {
 		svcMap[s.Name] = s
-	}
-
-	// grab alive timeout from TOML settings
-	alive := cfg.Settings.AliveSeconds
-	if alive <= 0 {
-		log.Fatalf("invalid alive_seconds in config: %d", alive)
-	}
-
-	// launch proxies
-	for _, svc := range cfg.Services {
-		go startProxy(svc, svcMap, alive)
+		go startProxy(s, svcMap, cfg.Settings.AliveSeconds)
 	}
 
 	select {}
@@ -76,7 +68,7 @@ func startProxy(svc Service, svcMap map[string]Service, alive int) {
 	for {
 		client, err := ln.Accept()
 		if err != nil {
-			log.Printf("accept error on %s: %v", listenAddr, err)
+			log.Printf("accept %s: %v", listenAddr, err)
 			continue
 		}
 		go handleClient(client, svc, svcMap, alive)
@@ -86,15 +78,16 @@ func startProxy(svc Service, svcMap map[string]Service, alive int) {
 func handleClient(client net.Conn, svc Service, svcMap map[string]Service, alive int) {
 	defer client.Close()
 
+	// 1) Gather deps and start (always)
+	log.Printf("Handling client for %s", svc.Name)
 	deps := collectDeps(svc.Name, svcMap)
 	startService(svc.Name, deps)
 
-	// schedule stopService
-	go func() {
-		time.Sleep(time.Duration(alive) * time.Second)
-		stopService(svc.Name, deps)
-	}()
+	// 2) Reset the stop timer for this service
+	resetStopTimer(svc.Name, deps, alive)
 
+	// 3) Proxy the connection
+	log.Printf("Proxying connection for %s to %s:%d", svc.Name, svc.Host, svc.Port)
 	remoteAddr := net.JoinHostPort(svc.Host, strconv.Itoa(svc.Port))
 	remote, err := net.Dial("tcp", remoteAddr)
 	if err != nil {
@@ -103,23 +96,38 @@ func handleClient(client net.Conn, svc Service, svcMap map[string]Service, alive
 	}
 	defer remote.Close()
 
+	log.Printf("Connected to remote %s", remoteAddr)
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		io.Copy(remote, client)
-	}()
-	go func() {
-		defer wg.Done()
-		io.Copy(client, remote)
-	}()
+	go func() { defer wg.Done(); io.Copy(remote, client) }()
+	go func() { defer wg.Done(); io.Copy(client, remote) }()
+	log.Printf("Started proxying for %s", svc.Name)
 	wg.Wait()
+	log.Printf("Finished proxying for %s", svc.Name)
+}
+
+// resetStopTimer stops any existing timer for `name`, then makes a new one.
+func resetStopTimer(name string, deps []string, alive int) {
+	log.Printf("Resetting stop timer for %s with deps %v", name, deps)
+	stopTimersMu.Lock()
+	defer stopTimersMu.Unlock()
+
+	if t, exists := stopTimers[name]; exists {
+		// Stop and drain
+		if !t.Stop() {
+			<-t.C
+		}
+	}
+
+	// Create a new timer that will call stopService after `alive` seconds
+	stopTimers[name] = time.AfterFunc(time.Duration(alive)*time.Second, func() {
+		stopService(name, deps)
+	})
 }
 
 func collectDeps(name string, svcMap map[string]Service) []string {
 	seen := make(map[string]bool)
 	var ordered []string
-
 	var dfs func(string)
 	dfs = func(n string) {
 		if seen[n] {
@@ -136,7 +144,6 @@ func collectDeps(name string, svcMap map[string]Service) []string {
 			ordered = append(ordered, d)
 		}
 	}
-
 	dfs(name)
 	return ordered
 }

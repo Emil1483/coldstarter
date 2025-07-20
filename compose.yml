@@ -1,0 +1,12 @@
+version: "3.8"
+
+services:
+  coldstarter:
+    build:
+      context: coldstarter
+    restart: unless-stopped
+    container_name: coldstarter
+    network_mode: host
+    volumes:
+      - ./configs/config.toml:/app/config.toml
+      - /var/run/docker.sock:/var/run/docker.sock

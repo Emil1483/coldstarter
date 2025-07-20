@@ -14,6 +14,8 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+//—— CONFIG TYPES —————————————————————————————————————————————————————————
+
 type Config struct {
 	Settings Settings  `toml:"settings"`
 	Services []Service `toml:"services"`
@@ -31,135 +33,236 @@ type Service struct {
 	Dependencies []string `toml:"dependencies"`
 }
 
-// stopTimers holds one timer per service name
-var (
-	// startLocks holds one buffered‐1 channel per service for TryLock
-	startLocks = make(map[string]chan struct{})
-)
+//—— SERVICE MANAGER ——————————————————————————————————————————————————————
+
+type ServiceManager struct {
+	deps     map[string][]string    // direct deps
+	alive    map[string]bool        // desired state
+	running  map[string]bool        // actual state
+	timers   map[string]*time.Timer // per-service stop timers
+	locks    map[string]*sync.Mutex // mutex guarding start/stop
+	aliveDur time.Duration
+
+	mu sync.Mutex // guards alive, running, timers
+}
+
+// NewServiceManager builds the graph and initializes maps
+func NewServiceManager(cfg Config) *ServiceManager {
+	sm := &ServiceManager{
+		deps:     make(map[string][]string),
+		alive:    make(map[string]bool),
+		running:  make(map[string]bool),
+		timers:   make(map[string]*time.Timer),
+		locks:    make(map[string]*sync.Mutex),
+		aliveDur: time.Duration(cfg.Settings.AliveSeconds) * time.Second,
+	}
+	for _, svc := range cfg.Services {
+		sm.deps[svc.Name] = svc.Dependencies
+		sm.locks[svc.Name] = &sync.Mutex{}
+		sm.alive[svc.Name] = false
+		sm.running[svc.Name] = false
+	}
+	return sm
+}
+
+func (sm *ServiceManager) startDependenciesConcurrently(svcName string) {
+	names := sm.dependencyOrder(svcName)
+
+	var wg sync.WaitGroup
+	wg.Add(len(names))
+
+	for _, name := range names {
+		// capture loop variable
+		name := name
+		go func() {
+			defer wg.Done()
+			sm.startIfNeeded(name)
+		}()
+	}
+
+	// wait for all of them to finish
+	wg.Wait()
+}
+
+// ServiceAlive is called on every incoming request to `svcName`
+func (sm *ServiceManager) ServiceAlive(svcName string) {
+	sm.mu.Lock()
+	// 1) mark desired state
+	if !sm.alive[svcName] {
+		sm.alive[svcName] = true
+	}
+	// 2) reset its stop-timer
+	if t, ok := sm.timers[svcName]; ok {
+		t.Stop()
+	}
+	sm.timers[svcName] = time.AfterFunc(sm.aliveDur, func() {
+		sm.ServiceDead(svcName)
+	})
+	sm.mu.Unlock()
+
+	// 3) ensure svc+deps are running
+	sm.startDependenciesConcurrently(svcName)
+
+}
+
+// ServiceDead is invoked once the timer fires for `svcName`
+func (sm *ServiceManager) ServiceDead(svcName string) {
+	sm.mu.Lock()
+	// 1) mark dead
+	sm.alive[svcName] = false
+	sm.mu.Unlock()
+
+	// 2) consider stopping svc + its deps (in reverse order)
+	for i := len(sm.dependencyOrder(svcName)) - 1; i >= 0; i-- {
+		name := sm.dependencyOrder(svcName)[i]
+		// only stop if no alive service wants it
+		if !sm.usedByAnyAlive(name) {
+			sm.stopIfNeeded(name)
+		}
+	}
+}
+
+// dependencyOrder returns a list [dep1,depDeps…, svcName] in topological order
+func (sm *ServiceManager) dependencyOrder(svcName string) []string {
+	var order []string
+	seen := map[string]bool{}
+	var dfs func(string)
+	dfs = func(name string) {
+		if seen[name] {
+			return
+		}
+		seen[name] = true
+		for _, d := range sm.deps[name] {
+			dfs(d)
+		}
+		order = append(order, name)
+	}
+	dfs(svcName)
+	return order
+}
+
+// usedByAnyAlive returns true if any currently-alive svc transitively depends on `name`
+func (sm *ServiceManager) usedByAnyAlive(name string) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	for svc, isAlive := range sm.alive {
+		if !isAlive {
+			continue
+		}
+		// see if `name` appears in this svc's dep-closure (or is svc itself)
+		for _, d := range sm.dependencyOrder(svc) {
+			if d == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// startIfNeeded calls startService(name) once, if not already running
+func (sm *ServiceManager) startIfNeeded(name string) {
+	sm.mu.Lock()
+	already := sm.running[name]
+	sm.mu.Unlock()
+	if already {
+		return
+	}
+
+	lock := sm.locks[name]
+	lock.Lock()
+	defer lock.Unlock()
+
+	// re-check after acquiring
+	sm.mu.Lock()
+	if sm.running[name] {
+		sm.mu.Unlock()
+		return
+	}
+	sm.mu.Unlock()
+
+	startService(name)
+
+	sm.mu.Lock()
+	sm.running[name] = true
+	sm.mu.Unlock()
+}
+
+// stopIfNeeded calls stopService(name) once, if currently running
+func (sm *ServiceManager) stopIfNeeded(name string) {
+	sm.mu.Lock()
+	running := sm.running[name]
+	sm.mu.Unlock()
+	if !running {
+		return
+	}
+
+	lock := sm.locks[name]
+	lock.Lock()
+	defer lock.Unlock()
+
+	// re-check after locking
+	sm.mu.Lock()
+	if !sm.running[name] {
+		sm.mu.Unlock()
+		return
+	}
+	sm.mu.Unlock()
+
+	stopService(name)
+
+	sm.mu.Lock()
+	sm.running[name] = false
+	sm.mu.Unlock()
+}
+
+//—— STUBBED SERVICE LIFECYCLE HOOKS ——————————————————————————————————————
+
+func startService(name string) {
+	log.Printf("🔼 startService(%q)", name)
+	time.Sleep(2 * time.Second)
+}
+
+func stopService(name string) {
+	log.Printf("🔽 stopService(%q)", name)
+	time.Sleep(2 * time.Second)
+}
+
+//—— HTTP PROXY SETUP —————————————————————————————————————————————————
 
 func main() {
+	// 1) load config
 	cfgPath := os.Getenv("CONFIG")
 	if cfgPath == "" {
-		log.Fatal("CONFIG env var not set")
+		log.Fatal("CONFIG not set")
 	}
-
 	var cfg Config
 	if _, err := toml.DecodeFile(cfgPath, &cfg); err != nil {
-		log.Fatalf("failed to decode TOML: %v", err)
+		log.Fatalf("decode TOML: %v", err)
 	}
 
-	// initialize maps
-	svcMap := make(map[string]Service, len(cfg.Services))
-	for _, s := range cfg.Services {
-		svcMap[s.Name] = s
-		// make a channel of capacity 1 for each service
-		startLocks[s.Name] = make(chan struct{}, 1)
-	}
+	// 2) build manager
+	mgr := NewServiceManager(cfg)
 
-	for _, s := range cfg.Services {
-		go startProxyHTTP(s, svcMap, cfg.Settings.AliveSeconds)
-	}
-
-	select {}
-}
-
-type serviceControl struct {
-	mu        sync.Mutex
-	isRunning bool
-	timer     *time.Timer
-	deps      []string
-}
-
-// controls maps service name → its control struct
-var controls = map[string]*serviceControl{}
-
-func startProxyHTTP(svc Service, svcMap map[string]Service, alive int) {
-	// prepare control for this service
-	ctrl := &serviceControl{deps: collectDeps(svc.Name, svcMap)}
-	controls[svc.Name] = ctrl
-
-	// target backend URL
-	targetURL := &url.URL{
-		Scheme: "http",
-		Host:   net.JoinHostPort(svc.Host, strconv.Itoa(svc.Port)),
-	}
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-
-	// our handler wraps the ReverseProxy
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 1) startService _synchronously_ on first hit after a stop
-		ctrl.mu.Lock()
-		if !ctrl.isRunning {
-			ctrl.isRunning = true
-			ctrl.mu.Unlock()
-
-			log.Printf("→ startService(%q)", svc.Name)
-			startService(svc.Name, ctrl.deps)
-		} else {
-			ctrl.mu.Unlock()
-		}
-
-		// 2) reset (or create) the stop timer
-		ctrl.mu.Lock()
-		if ctrl.timer == nil {
-			// first time: create
-			ctrl.timer = time.AfterFunc(time.Duration(alive)*time.Second, func() {
-				log.Printf("← stopService(%q)", svc.Name)
-				stopService(svc.Name, ctrl.deps)
-
-				ctrl.mu.Lock()
-				ctrl.isRunning = false
-				ctrl.mu.Unlock()
+	// 3) launch one HTTP reverse-proxy per service
+	for _, svc := range cfg.Services {
+		go func(s Service) {
+			proxy := httputil.NewSingleHostReverseProxy(&url.URL{
+				Scheme: "http",
+				Host:   net.JoinHostPort(s.Host, strconv.Itoa(s.Port)),
 			})
-		} else {
-			// reuse: stop old and start new
-			ctrl.timer.Stop()
-			ctrl.timer.Reset(time.Duration(alive) * time.Second)
-		}
-		ctrl.mu.Unlock()
 
-		// 3) now proxy the request
-		proxy.ServeHTTP(w, r)
-	})
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// mark activity
+				mgr.ServiceAlive(s.Name)
+				// proxy the request
+				proxy.ServeHTTP(w, r)
+			})
 
-	listenAddr := ":" + strconv.Itoa(svc.ExposedPort)
-	log.Printf("HTTP proxy %q listening on %s → %s", svc.Name, listenAddr, targetURL.Host)
-	if err := http.ListenAndServe(listenAddr, handler); err != nil {
-		log.Fatalf("proxy %q failed: %v", svc.Name, err)
+			addr := ":" + strconv.Itoa(s.ExposedPort)
+			log.Printf("➡️  [%s] http proxy on %s → %s", s.Name, addr, s.Host)
+			log.Fatal(http.ListenAndServe(addr, handler))
+		}(svc)
 	}
-}
 
-func collectDeps(name string, svcMap map[string]Service) []string {
-	seen := make(map[string]bool)
-	var ordered []string
-	var dfs func(string)
-	dfs = func(n string) {
-		if seen[n] {
-			return
-		}
-		seen[n] = true
-		s, ok := svcMap[n]
-		if !ok {
-			log.Printf("warning: unknown service %q", n)
-			return
-		}
-		for _, d := range s.Dependencies {
-			dfs(d)
-			ordered = append(ordered, d)
-		}
-	}
-	dfs(name)
-	return ordered
-}
-
-func startService(name string, deps []string) {
-	log.Printf("Starting %s with deps %v", name, deps)
-	time.Sleep(2 * time.Second)
-	log.Printf("%s started", name)
-}
-
-func stopService(name string, deps []string) {
-	log.Printf("Stopping %s with deps %v", name, deps)
-	time.Sleep(2 * time.Second)
-	log.Printf("%s stopped", name)
+	select {} // never exit
 }

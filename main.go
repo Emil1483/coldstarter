@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net"
 	"net/http"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
 )
 
 //—— CONFIG TYPES —————————————————————————————————————————————————————————
@@ -219,12 +222,51 @@ func (sm *ServiceManager) stopIfNeeded(name string) {
 
 func startService(name string) {
 	log.Printf("🔼 startService(%q)", name)
-	time.Sleep(2 * time.Second)
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		log.Printf("Error creating Docker client: %v\n", err)
+	}
+	cli.NegotiateAPIVersion(ctx)
+
+	// Inspect the container by name to get its ID
+	ctrJSON, err := cli.ContainerInspect(ctx, name)
+	if err != nil {
+		log.Printf("Error inspecting container '%s': %v\n", name, err)
+		return
+	}
+
+	cli.NegotiateAPIVersion(ctx)
+
+	if err := cli.ContainerStart(ctx, ctrJSON.ID, container.StartOptions{}); err != nil {
+		log.Printf("Error starting container '%s': %v\n", name, err)
+		return
+	}
+	log.Printf("Container '%s' started (ID: %s)\n", name, ctrJSON.ID)
 }
 
 func stopService(name string) {
 	log.Printf("🔽 stopService(%q)", name)
-	time.Sleep(2 * time.Second)
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		log.Printf("Error creating Docker client: %v\n", err)
+		return
+	}
+	cli.NegotiateAPIVersion(ctx)
+	// Inspect the container by name to get its ID
+	ctrJSON, err := cli.ContainerInspect(ctx, name)
+	if err != nil {
+		log.Printf("Error inspecting container '%s': %v\n", name, err)
+		return
+	}
+	cli.NegotiateAPIVersion(ctx)
+
+	if err := cli.ContainerStop(ctx, ctrJSON.ID, container.StopOptions{}); err != nil {
+		log.Printf("Error stopping container '%s': %v\n", name, err)
+		return
+	}
+	log.Printf("Container '%s' stopped (ID: %s)\n", name, ctrJSON.ID)
 }
 
 //—— HTTP PROXY SETUP —————————————————————————————————————————————————

@@ -4,7 +4,7 @@ alive_seconds = 10
 
 # Service definitions
 [[services]]
-name        = "Postgres"
+name        = "postgres"
 host        = "127.0.0.1"
 port        = 5432
 exposedPort = 5433
@@ -14,11 +14,11 @@ name        = "Website"
 host        = "127.0.0.1"
 port        = 3000
 exposedPort = 3001
-dependencies = ["Postgres"]
+dependencies = ["postgres"]
 
 [[services]]
 name        = "Admin"
 host        = "127.0.0.1"
 port        = 4000
 exposedPort = 4001
-dependencies = ["Postgres", "Website"]
+dependencies = ["postgres", "Website"]

@@ -264,6 +264,7 @@ func startService(svc Service) {
 	defer cancel()
 
 	client := &http.Client{Timeout: 2 * time.Second}
+	emptyReplies := 0
 
 	for {
 		select {
@@ -279,8 +280,12 @@ func startService(svc Service) {
 			}
 
 			if errors.Is(err, io.EOF) {
-				log.Println("🎉 Empty reply (EOF) received; " + svc.Name + " is up!")
-				return
+				emptyReplies++
+				log.Println("Empty reply (EOF) received from " + svc.Name)
+				if emptyReplies > 10 {
+					log.Printf("🎉 Got 10 empty replies from %s. Assuming this is ok.\n", svc.Name)
+					return
+				}
 			}
 
 			log.Printf("Waiting for service at %s… (%v)\n", url, err)

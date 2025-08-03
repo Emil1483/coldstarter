@@ -10,15 +10,15 @@ port        = 5432
 exposedPort = 5433
 
 [[services]]
-name        = "Website"
+name        = "website"
 host        = "127.0.0.1"
 port        = 3000
 exposedPort = 3001
 dependencies = ["postgres"]
 
 [[services]]
-name        = "Admin"
+name        = "admin"
 host        = "127.0.0.1"
 port        = 4000
 exposedPort = 4001
-dependencies = ["postgres", "Website"]
+dependencies = ["postgres", "website"]

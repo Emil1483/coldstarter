@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -45,6 +47,7 @@ type ServiceManager struct {
 	timers   map[string]*time.Timer // per-service stop timers
 	locks    map[string]*sync.Mutex // mutex guarding start/stop
 	aliveDur time.Duration
+	cfg      Config
 
 	mu sync.Mutex // guards alive, running, timers
 }
@@ -58,6 +61,7 @@ func NewServiceManager(cfg Config) *ServiceManager {
 		timers:   make(map[string]*time.Timer),
 		locks:    make(map[string]*sync.Mutex),
 		aliveDur: time.Duration(cfg.Settings.AliveSeconds) * time.Second,
+		cfg:      cfg,
 	}
 	for _, svc := range cfg.Services {
 		sm.deps[svc.Name] = svc.Dependencies
@@ -162,6 +166,15 @@ func (sm *ServiceManager) usedByAnyAlive(name string) bool {
 	return false
 }
 
+func (sm *ServiceManager) getServiceFromName(name string) Service {
+	for _, svc := range sm.cfg.Services {
+		if svc.Name == name {
+			return svc
+		}
+	}
+	panic("unknown service: " + name)
+}
+
 // startIfNeeded calls startService(name) once, if not already running
 func (sm *ServiceManager) startIfNeeded(name string) {
 	sm.mu.Lock()
@@ -183,7 +196,8 @@ func (sm *ServiceManager) startIfNeeded(name string) {
 	}
 	sm.mu.Unlock()
 
-	startService(name)
+	svc := sm.getServiceFromName(name)
+	startService(svc)
 
 	sm.mu.Lock()
 	sm.running[name] = true
@@ -220,7 +234,8 @@ func (sm *ServiceManager) stopIfNeeded(name string) {
 
 //—— STUBBED SERVICE LIFECYCLE HOOKS ——————————————————————————————————————
 
-func startService(name string) {
+func startService(svc Service) {
+	name := svc.Name
 	log.Printf("🔼 startService(%q)", name)
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv)
@@ -243,6 +258,35 @@ func startService(name string) {
 		return
 	}
 	log.Printf("Container '%s' started (ID: %s)\n", name, ctrJSON.ID)
+
+	url := "http://" + svc.Host + ":" + strconv.Itoa(svc.Port)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Timeout waiting for server at %s\n", url)
+			return
+		default:
+			resp, err := client.Get(url)
+			if err == nil {
+				resp.Body.Close()
+				log.Println("🎉 " + svc.Name + " is up")
+				return
+			}
+
+			if errors.Is(err, io.EOF) {
+				log.Println("🎉 Empty reply (EOF) received; " + svc.Name + " is up!")
+				return
+			}
+
+			log.Printf("Waiting for service at %s… (%v)\n", url, err)
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
 }
 
 func stopService(name string) {
@@ -280,6 +324,21 @@ func main() {
 	var cfg Config
 	if _, err := toml.DecodeFile(cfgPath, &cfg); err != nil {
 		log.Fatalf("decode TOML: %v", err)
+	}
+
+	for _, svc := range cfg.Services {
+		for _, dep := range svc.Dependencies {
+			var found bool = false
+			for _, other := range cfg.Services {
+				if other.Name == dep {
+					found = true
+					break
+				}
+			}
+			if !found {
+				panic("service " + svc.Name + " depends on unknown service " + dep)
+			}
+		}
 	}
 
 	// 2) build manager
